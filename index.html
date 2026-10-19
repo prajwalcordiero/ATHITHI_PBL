@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3D Indoor Navigation</title>
+<style>
+:root{--bg:#e9eef5;--panel:rgba(255,255,255,.93);--tx:#1c2430;--mut:#5d6b7e;--ac:#1f7ae0;--bd:#cfd7e2;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f141b;--panel:rgba(24,31,42,.93);--tx:#e8edf5;--mut:#9aa8bb;--ac:#4da3ff;--bd:#2e3948}}
+:root[data-theme="dark"]{--bg:#0f141b;--panel:rgba(24,31,42,.93);--tx:#e8edf5;--mut:#9aa8bb;--ac:#4da3ff;--bd:#2e3948}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden}
+canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+.panel{position:fixed;left:10px;top:calc(10px + env(safe-area-inset-top,0px));width:min(310px,calc(100vw - 20px));max-height:calc(100% - 150px);overflow:auto;background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:12px}
+h1{font-size:15px;margin:0 0 8px}
+label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
+select,button{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:6px 8px}
+select{width:100%}
+.row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+button{cursor:pointer}button.on,button.pri{background:var(--ac);color:#fff;border-color:var(--ac)}
+.stat{margin-top:10px;padding-top:8px;border-top:1px solid var(--bd);font-size:13px}
+.stat b{color:var(--mut);font-weight:500}
+#inst{font-size:15px;font-weight:600;color:var(--ac);margin-top:4px}
+.help{font-size:11px;color:var(--mut);margin-top:8px}
+#mm{position:fixed;left:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));width:200px;height:120px;border:1px solid var(--bd);border-radius:8px}
+.pad{position:fixed;right:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));display:grid;grid-template-columns:repeat(3,46px);gap:5px}
+.pad button{height:46px;font-size:18px;background:var(--panel);user-select:none;touch-action:none}
+</style></head><body>
+<canvas id="c"></canvas>
+<div class="panel">
+<h1>3D Indoor Navigation</h1>
+<label for="st">Start (your position)</label><select id="st"></select>
+<label for="ds">Destination</label><select id="ds"></select>
+<div class="row"><button class="pri" id="go">Navigate</button><button id="auto">Auto-walk: off</button><button id="cam">Camera: chase</button></div>
+<div class="row"><label style="margin:0"><input type="checkbox" id="both"> Show both floors</label></div>
+<div class="stat"><b>Floor:</b> <span id="sF"></span> &nbsp; <b>Location:</b> <span id="sL"></span><br><b>Remaining:</b> <span id="sR">–</span>
+<div id="inst">Pick a destination</div></div>
+<div class="help">Arrows / WASD: ↑ forward, ↓ back, ← → turn. <b>E</b> or Space takes the stairs (near the Staircase). Drag to orbit, scroll to zoom.</div>
+</div>
+<canvas id="mm" width="200" height="120"></canvas>
+<div class="pad"><span></span><button data-k="up">▲</button><span></span><button data-k="left">◀</button><button data-k="down">▼</button><button data-k="right">▶</button><button data-k="stairs" style="grid-column:1/4;font-size:12px">Take stairs (E)</button></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const FH=6,$=id=>document.getElementById(id),clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const norm=a=>{while(a>Math.PI)a-=2*Math.PI;while(a<-Math.PI)a+=2*Math.PI;return a};
+/* ---------- building data: edit names here ---------- */
+const NAMES={0:{n:['Reception','Café','Library','Staircase'],s:['Computer Lab','Admin Office','Seminar Hall','Restrooms']},
+1:{n:['Classroom 201','Classroom 202','HOD Office','Staircase'],s:['Server Room','Conference Room','Faculty Lounge','Restrooms']}};
+const COL=['#f4b183','#a9d18e','#9dc3e6','#ffd966','#c9b1e8','#8fd3c8','#f2a7c3','#c8ccd2'];
+const rooms=[];
+for(const f of [0,1])for(const s of ['n','s'])for(let i=0;i<4;i++){const cx=-15+10*i,sg=s==='n'?-1:1;
+ rooms.push({id:`${f}${s}${i}`,name:NAMES[f][s][i],f,s,i,cx,cz:7*sg,dz:2*sg,x0:cx-5,x1:cx+5,z0:s==='n'?-12:2,z1:s==='n'?-2:12,stair:s==='n'&&i===3,node:`${f}r${i}${s}`,col:COL[(i*2+(s==='n'?0:1)+f)%8]})}
+/* ---------- routing graph ---------- */
+const nodes=new Map(),adj=new Map();
+const addN=(id,x,z,f)=>{nodes.set(id,{x,z,f});adj.set(id,[])};
+const link=(a,b,w)=>{const A=nodes.get(a),B=nodes.get(b);w=w??Math.hypot(A.x-B.x,A.z-B.z);adj.get(a).push([b,w]);adj.get(b).push([a,w])};
+for(const f of [0,1])for(let i=0;i<4;i++){const cx=-15+10*i;addN(`${f}c${i}`,cx,0,f);if(i)link(`${f}c${i-1}`,`${f}c${i}`);
+ for(const s of ['n','s']){const sg=s==='n'?-1:1;addN(`${f}d${i}${s}`,cx,2*sg,f);addN(`${f}r${i}${s}`,cx,7*sg,f);link(`${f}c${i}`,`${f}d${i}${s}`);link(`${f}d${i}${s}`,`${f}r${i}${s}`)}}
+link('0r3n','1r3n',10);
+function dij(s,t){const d=new Map([[s,0]]),p=new Map(),q=new Set([s]),done=new Set();
+ while(q.size){let u=null;for(const k of q)if(u===null||d.get(k)<d.get(u))u=k;q.delete(u);if(u===t)break;done.add(u);
+  for(const[v,w]of adj.get(u)){if(done.has(v))continue;const nd=d.get(u)+w;if(!d.has(v)||nd<d.get(v)){d.set(v,nd);p.set(v,u);q.add(v)}}}
+ const o=[t];while(o[0]!==s&&p.has(o[0]))o.unshift(p.get(o[0]));return o}
+const roomAt=(f,x,z)=>{if(z>-2&&z<2)return null;return rooms.find(r=>r.f===f&&x>=r.x0&&x<r.x1&&(z<0?r.s==='n':r.s==='s'))||null};
+/* ---------- walls ---------- */
+const walls=[],T=.15;
+const wX=(z,a,b)=>b>a&&walls.push([a,z-T,b,z+T]),wZ=(x,a,b)=>walls.push([x-T,a,x+T,b]);
+wX(-12,-20,20);wX(12,-20,20);wZ(-20,-12,12);wZ(20,-12,12);
+for(const z of[-2,2]){let a=-20;for(let i=0;i<4;i++){const cx=-15+10*i;wX(z,a,cx-1.2);a=cx+1.2}wX(z,a,20)}
+for(const x of[-10,0,10]){wZ(x,-12,-2);wZ(x,2,12)}
+const hit=(x,z)=>walls.some(w=>x>w[0]-.45&&x<w[2]+.45&&z>w[1]-.45&&z<w[3]+.45);
+/* ---------- three.js scene ---------- */
+const cv=$('c'),renderer=new THREE.WebGLRenderer({canvas:cv,antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene(),cam=new THREE.PerspectiveCamera(50,1,.1,300);
+scene.add(new THREE.AmbientLight(0xffffff,.8));const sun=new THREE.DirectionalLight(0xffffff,.6);sun.position.set(10,30,12);scene.add(sun);
+const wallMat=new THREE.MeshLambertMaterial({color:0xb9c3d3,transparent:true,opacity:.9}),boxG=new THREE.BoxGeometry(1,1,1);
+function label(t){const c=document.createElement('canvas');c.width=256;c.height=64;const g=c.getContext('2d');g.fillStyle='rgba(255,255,255,.88)';
+ g.beginPath();g.roundRect?g.roundRect(4,8,248,48,12):g.rect(4,8,248,48);g.fill();g.fillStyle='#1c2430';g.font='600 26px system-ui,sans-serif';g.textAlign='center';g.textBaseline='middle';g.fillText(t,128,33,236);
+ const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),transparent:true}));s.scale.set(6,1.5,1);return s}
+const G=[new THREE.Group(),new THREE.Group()];
+for(const f of[0,1]){const g=G[f];g.position.y=f*FH;scene.add(g);
+ const slab=new THREE.Mesh(boxG,new THREE.MeshLambertMaterial({color:0xdde3ec}));slab.scale.set(40,.3,24);slab.position.y=-.15;g.add(slab);
+ const cor=new THREE.Mesh(boxG,new THREE.MeshLambertMaterial({color:0xc4ccd8}));cor.scale.set(40,.02,4);cor.position.y=.01;g.add(cor);
+ for(const r of rooms.filter(r=>r.f===f)){const m=new THREE.Mesh(boxG,new THREE.MeshLambertMaterial({color:r.col}));m.scale.set(9.7,.02,9.7);m.position.set(r.cx,.01,r.cz);g.add(m);
+  const l=label(r.name);l.position.set(r.cx,2.4,r.cz);g.add(l)}
+ for(const w of walls){const m=new THREE.Mesh(boxG,wallMat);m.scale.set(w[2]-w[0],3,w[3]-w[1]);m.position.set((w[0]+w[2])/2,1.5,(w[1]+w[3])/2);g.add(m)}}
+for(let k=0;k<10;k++){const h=(k+1)*.55,m=new THREE.Mesh(boxG,new THREE.MeshLambertMaterial({color:0x8d99ab}));m.scale.set(2.4,h,.8);m.position.set(18.3,h/2,-3.6-k*.85);G[0].add(m)}
+const av={x:-15,z:-7,f:0,y:0,rot:0};
+const body=new THREE.Group();scene.add(body);
+const mb=new THREE.MeshLambertMaterial({color:0x1f7ae0});
+const cyl=new THREE.Mesh(new THREE.CylinderGeometry(.35,.35,1.1,16),mb);cyl.position.y=.55;
+const head=new THREE.Mesh(new THREE.SphereGeometry(.3,16,12),mb);head.position.y=1.4;
+const nose=new THREE.Mesh(new THREE.ConeGeometry(.16,.45,12),new THREE.MeshLambertMaterial({color:0xffb020}));nose.rotation.x=Math.PI/2;nose.position.set(0,.9,.5);
+body.add(cyl,head,nose);
+const arrow=new THREE.Group(),ar=new THREE.Mesh(new THREE.ConeGeometry(.4,1.3,16),new THREE.MeshBasicMaterial({color:0x22c55e}));ar.rotation.x=Math.PI/2;ar.position.z=.4;arrow.add(ar);scene.add(arrow);
+const pathG=new THREE.Group();scene.add(pathG);let beacons=[];
+const pm=new THREE.MeshBasicMaterial({color:0x22c55e,transparent:true,opacity:.9});
+/* ---------- UI ---------- */
+const st=$('st'),ds=$('ds'),fl=i=>i?'First floor':'Ground floor';
+for(const r of rooms){for(const s of[st,ds]){const o=document.createElement('option');o.value=r.id;o.textContent=`${r.name} (${fl(r.f)})`;s.appendChild(o)}}
+let destId='1s1',navOn=true,auto=false,camMode='chase',pitch=.6,dist=9,yawOff=0,pts=null,both=false;
+ds.value=destId;st.value='0n0';
+function teleport(id){const r=rooms.find(r=>r.id===id);av.x=r.cx;av.z=r.cz;av.f=r.f;av.y=r.f*FH;av.rot=r.s==='n'?0:Math.PI}
+st.onchange=()=>{teleport(st.value);st.blur();upd()};
+ds.onchange=()=>{destId=ds.value;navOn=true;ds.blur();upd()};
+$('go').onclick=()=>{destId=ds.value;navOn=true;upd()};
+$('auto').onclick=e=>{auto=!auto;e.target.textContent='Auto-walk: '+(auto?'on':'off');e.target.classList.toggle('on',auto);if(auto)navOn=true};
+$('cam').onclick=e=>{camMode=camMode==='chase'?'top':'chase';e.target.textContent='Camera: '+(camMode==='chase'?'chase':'overview')};
+$('both').onchange=e=>{both=e.target.checked};
+/* ---------- input ---------- */
+const keys={up:0,down:0,left:0,right:0},KM={ArrowUp:'up',KeyW:'up',ArrowDown:'down',KeyS:'down',ArrowLeft:'left',KeyA:'left',ArrowRight:'right',KeyD:'right'};
+addEventListener('keydown',e=>{if(e.target.tagName==='SELECT')return;if(KM[e.code]){keys[KM[e.code]]=1;auto=false;$('auto').textContent='Auto-walk: off';$('auto').classList.remove('on');e.preventDefault()}
+ if(e.code==='KeyE'||e.code==='Space'){climb();e.preventDefault()}});
+addEventListener('keyup',e=>{if(KM[e.code])keys[KM[e.code]]=0});
+document.querySelectorAll('.pad button').forEach(b=>{const k=b.dataset.k;
+ b.onpointerdown=()=>{if(k==='stairs')climb();else{keys[k]=1;auto=false}};b.onpointerup=b.onpointerleave=()=>{if(k!=='stairs')keys[k]=0}});
+let drag=null;cv.onpointerdown=e=>{drag=[e.clientX,e.clientY]};addEventListener('pointerup',()=>drag=null);
+addEventListener('pointermove',e=>{if(!drag)return;yawOff-=(e.clientX-drag[0])*.005;pitch=clamp(pitch+(e.clientY-drag[1])*.004,.15,1.4);drag=[e.clientX,e.clientY]});
+cv.addEventListener('wheel',e=>{dist=clamp(dist+e.deltaY*.01,4,20);e.preventDefault()},{passive:false});
+function resize(){renderer.setSize(innerWidth,innerHeight,false);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()}addEventListener('resize',resize);resize();
+function climb(){if(Math.abs(av.y-av.f*FH)>.25)return;if(Math.hypot(av.x-15,av.z+7)<3.5)av.f=1-av.f}
+/* ---------- route planning + live tracking ---------- */
+function plan(){const dr=rooms.find(r=>r.id===destId),dn=nodes.get(dr.node),cur=roomAt(av.f,av.x,av.z);
+ if(cur&&cur.id===destId)return[{x:av.x,z:av.z,f:av.f},dn];
+ let s;if(cur)s=cur.stair?cur.node:`${av.f}d${cur.i}${cur.s}`;else s=`${av.f}c${clamp(Math.round((av.x+15)/10),0,3)}`;
+ let p=dij(s,dr.node).map(id=>nodes.get(id));
+ if(!cur&&p.length>1&&p[0].z===0&&p[1].z===0&&(av.x-p[0].x)*(p[1].x-p[0].x)>0)p.shift();
+ p=[{x:av.x,z:av.z,f:av.f},...p];
+ while(p.length>2&&p[1].f===av.f&&Math.hypot(p[1].x-av.x,p[1].z-av.z)<1.2)p.splice(1,1);
+ return p}
+const vis=f=>f===0||av.f===1||both;
+function rebuild(){pathG.clear();beacons=[];if(!pts)return;
+ for(let i=0;i<pts.length-1;i++){const a=pts[i],b=pts[i+1];
+  if(a.f===b.f){if(!vis(a.f))continue;const dx=b.x-a.x,dz=b.z-a.z,L=Math.hypot(dx,dz);if(L<.01)continue;
+   const m=new THREE.Mesh(boxG,pm);m.scale.set(.5,.06,L);m.position.set((a.x+b.x)/2,a.f*FH+.2,(a.z+b.z)/2);m.rotation.y=Math.atan2(dx,dz);pathG.add(m)}
+  else for(const f of[0,1]){if(!vis(f))continue;beacon(a.x,f*FH,a.z,0xffb020,3)}}
+ const e=pts[pts.length-1];if(vis(e.f))beacon(e.x,e.f*FH,e.z,0xef4444,4)}
+function beacon(x,y,z,c,h){const m=new THREE.Mesh(new THREE.CylinderGeometry(.6,.6,h,20,1,true),new THREE.MeshBasicMaterial({color:c,transparent:true,opacity:.45,side:THREE.DoubleSide}));
+ m.position.set(x,y+h/2,z);pathG.add(m);beacons.push(m)}
+function upd(){const cur=roomAt(av.f,av.x,av.z);$('sF').textContent=fl(av.f);
+ const near=Math.hypot(av.x-15,av.z+7)<3.5;$('sL').textContent=cur?cur.name:'Corridor';
+ const dr=rooms.find(r=>r.id===destId),dn=nodes.get(dr.node);
+ if(!navOn){pts=null;rebuild();$('sR').textContent='–';$('inst').textContent='Pick a destination';return}
+ if(dn.f===av.f&&Math.hypot(dn.x-av.x,dn.z-av.z)<1.6){navOn=false;pts=null;rebuild();$('sR').textContent='0 m';$('inst').textContent='You’ve arrived at '+dr.name;return}
+ pts=plan();let rem=0;for(let i=0;i<pts.length-1;i++)rem+=pts[i].f===pts[i+1].f?Math.hypot(pts[i+1].x-pts[i].x,pts[i+1].z-pts[i].z):10;
+ $('sR').textContent=Math.round(rem)+' m → '+dr.name;const n=pts[1];let t;
+ if(n.f!==av.f)t=near?'Take the stairs ('+(n.f>av.f?'up':'down')+') – press E':'Head to the Staircase';
+ else{const dx=n.x-av.x,dz=n.z-av.z,d=Math.round(Math.hypot(dx,dz)),df=norm(Math.atan2(dx,dz)-av.rot),a=Math.abs(df);
+  t=a<.35?`Continue straight ${d} m`:a>2.6?`Turn around`:`Turn ${df>0?'left':'right'}, then ${d} m`}
+ $('inst').textContent=t;rebuild()}
+/* ---------- minimap ---------- */
+const mm=$('mm').getContext('2d'),S=5,X=x=>(x+20)*S,Z=z=>(z+12)*S;
+function mini(){mm.fillStyle='#e8edf3';mm.fillRect(0,0,200,120);mm.fillStyle='#c9d1dc';mm.fillRect(0,Z(-2),200,20);mm.font='7px sans-serif';
+ for(const r of rooms.filter(r=>r.f===av.f)){mm.fillStyle=r.col;mm.fillRect(X(r.x0)+1,Z(r.z0)+1,48,48);mm.fillStyle='#1c2430';mm.fillText(r.name,X(r.x0)+3,Z(r.z0)+(r.s==='n'?9:46),44)}
+ if(pts){mm.strokeStyle='#16a34a';mm.lineWidth=2;mm.beginPath();let on=false;for(const p of pts){if(p.f!==av.f){on=false;continue}on?mm.lineTo(X(p.x),Z(p.z)):mm.moveTo(X(p.x),Z(p.z));on=true}mm.stroke();
+  const e=pts[pts.length-1];if(e.f===av.f){mm.fillStyle='#ef4444';mm.beginPath();mm.arc(X(e.x),Z(e.z),4,0,7);mm.fill()}}
+ mm.save();mm.translate(X(av.x),Z(av.z));mm.rotate(Math.PI-av.rot);mm.fillStyle='#1f7ae0';mm.beginPath();mm.moveTo(0,-7);mm.lineTo(5,5);mm.lineTo(-5,5);mm.fill();mm.restore()}
+/* ---------- main loop ---------- */
+let last=performance.now(),acc=1;
+function frame(now){requestAnimationFrame(frame);const dt=Math.min(.05,(now-last)/1000);last=now;
+ const climbing=Math.abs(av.y-av.f*FH)>.25;let mv=(keys.up?1:0)-(keys.down?.6:0),tr=(keys.left?1:0)-(keys.right?1:0);
+ if(auto&&navOn&&pts&&pts.length>1&&!climbing){const n=pts[1],d=Math.hypot(n.x-av.x,n.z-av.z);
+  if(n.f!==av.f&&d<1.1)climb();else{const df=norm(Math.atan2(n.x-av.x,n.z-av.z)-av.rot);av.rot+=clamp(df,-3*dt,3*dt);mv=Math.abs(df)<.6?1:0;tr=0}}
+ if(!climbing){av.rot+=tr*2.2*dt;const sx=Math.sin(av.rot)*mv*6*dt,sz=Math.cos(av.rot)*mv*6*dt;if(!hit(av.x+sx,av.z))av.x+=sx;if(!hit(av.x,av.z+sz))av.z+=sz}
+ av.y+=(av.f*FH-av.y)*Math.min(1,dt*3);if(Math.abs(av.y-av.f*FH)<.02)av.y=av.f*FH;
+ G[1].visible=vis(1);body.position.set(av.x,av.y,av.z);body.rotation.y=av.rot;
+ acc+=dt;if(acc>.2){acc=0;upd()}
+ arrow.visible=!!(navOn&&pts&&pts.length>1);if(arrow.visible){const n=pts[1];arrow.position.set(av.x,av.y+2.6,av.z);arrow.rotation.y=n.f!==av.f?av.rot:Math.atan2(n.x-av.x,n.z-av.z)}
+ const t=now/1000;beacons.forEach(b=>{b.scale.set(1+.2*Math.sin(t*4),1,1+.2*Math.sin(t*4))});
+ if(camMode==='chase'){const yw=av.rot+yawOff,cp=Math.cos(pitch);cam.up.set(0,1,0);
+  cam.position.lerp(new THREE.Vector3(av.x-Math.sin(yw)*dist*cp,av.y+1+dist*Math.sin(pitch),av.z-Math.cos(yw)*dist*cp),.15);cam.lookAt(av.x,av.y+1,av.z)}
+ else{const h=Math.max(30,22/(Math.tan(.436)*cam.aspect));cam.up.set(0,0,-1);cam.position.set(0,av.y+h,.01);cam.lookAt(0,av.y,0)}
+ renderer.render(scene,cam);mini()}
+upd();requestAnimationFrame(frame);
+</script></body></html>
